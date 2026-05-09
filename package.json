@@ -1,0 +1,37 @@
+{
+  "name": "blockride",
+  "version": "0.1.0",
+  "description": "BlockRide - peer-to-peer carpooling DApp with on-chain fare escrow, cancellation refunds and Sepolia deployment.",
+  "private": true,
+  "author": "TODO_NAME <TODO_EMAIL>",
+  "wallet": "0xee1369829b0a9D12d2Dcb2D0735ecA493E47A2E9",
+  "license": "MIT",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:sepolia": "hardhat run scripts/deploy.js --network sepolia",
+    "deploy:local": "hardhat run scripts/deploy.js --network localhost",
+    "node": "hardhat node",
+    "coverage": "hardhat coverage"
+  },
+  "devDependencies": {
+    "@ethersproject/abi": "^5.4.7",
+    "@ethersproject/providers": "^5.4.7",
+    "@nomicfoundation/hardhat-chai-matchers": "^1.0.0",
+    "@nomicfoundation/hardhat-network-helpers": "^1.0.0",
+    "@nomicfoundation/hardhat-toolbox": "^2.0.0",
+    "@nomiclabs/hardhat-ethers": "^2.0.0",
+    "@nomiclabs/hardhat-etherscan": "^3.0.0",
+    "@nomiclabs/hardhat-waffle": "^2.0.3",
+    "@typechain/ethers-v5": "^10.1.0",
+    "@typechain/hardhat": "^6.1.2",
+    "chai": "^4.2.0",
+    "dotenv": "^16.0.2",
+    "ethers": "^5.0.0",
+    "hardhat": "^2.11.2",
+    "hardhat-deploy": "^0.11.15",
+    "hardhat-gas-reporter": "^1.0.8",
+    "solidity-coverage": "^0.8.0",
+    "typechain": "^8.1.0"
+  }
+}
