@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "BlockRide - peer-to-peer carpooling DApp with on-chain fare escrow, cancellation refunds and Sepolia deployment.",
   "private": true,
-  "author": "TODO_NAME <TODO_EMAIL>",
+  "author": "Likhith Vardhan Goruputi <lvg8030@nyu.edu> (https://github.com/likhith2366)",
   "wallet": "0xee1369829b0a9D12d2Dcb2D0735ecA493E47A2E9",
   "license": "MIT",
   "scripts": {
