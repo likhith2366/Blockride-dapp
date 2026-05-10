@@ -5,6 +5,7 @@ import { postRide, getMyAddress } from "../../utils/contract";
 import { useTx } from "../../hooks/useTx";
 import TxModal from "../../components/TxModal";
 import Identicon from "../../components/Identicon";
+import DisconnectButton from "../../components/DisconnectButton";
 import styles from "../../styles/Home.module.css";
 import form from "../../styles/rides.module.css";
 
@@ -58,10 +59,13 @@ export default function Publish() {
           <span>BlockRide</span>
         </Link>
         {address && (
-          <span className={styles.addressPill}>
-            <Identicon address={address} size={22} />
-            <span>{address.slice(0, 6)}...{address.slice(-4)}</span>
-          </span>
+          <div className={styles.userArea}>
+            <span className={styles.addressPill}>
+              <Identicon address={address} size={22} />
+              <span>{address.slice(0, 6)}...{address.slice(-4)}</span>
+            </span>
+            <DisconnectButton className={styles.disconnectBtn} />
+          </div>
         )}
       </header>
 

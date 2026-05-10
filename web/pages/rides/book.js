@@ -14,6 +14,7 @@ import TxModal from "../../components/TxModal";
 import Identicon from "../../components/Identicon";
 import StatusBadge from "../../components/StatusBadge";
 import StarRating from "../../components/StarRating";
+import DisconnectButton from "../../components/DisconnectButton";
 import styles from "../../styles/Home.module.css";
 import form from "../../styles/rides.module.css";
 
@@ -83,10 +84,13 @@ export default function Book() {
           <span>BlockRide</span>
         </Link>
         {address && (
-          <Link href="/profile" className={styles.addressPill}>
-            <Identicon address={address} size={22} />
-            <span>{address.slice(0, 6)}...{address.slice(-4)}</span>
-          </Link>
+          <div className={styles.userArea}>
+            <Link href="/profile" className={styles.addressPill}>
+              <Identicon address={address} size={22} />
+              <span>{address.slice(0, 6)}...{address.slice(-4)}</span>
+            </Link>
+            <DisconnectButton className={styles.disconnectBtn} />
+          </div>
         )}
       </header>
 

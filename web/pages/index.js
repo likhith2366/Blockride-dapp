@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { ethers } from "ethers";
 import { CHAIN_ID, CONTRACT_ADDRESS, CONTRACT_ABI, BLOCK_EXPLORER } from "../constants";
 import Identicon from "../components/Identicon";
+import DisconnectButton from "../components/DisconnectButton";
 import styles from "../styles/Home.module.css";
 
 export default function Home() {
@@ -64,10 +65,13 @@ export default function Home() {
             <span>BlockRide</span>
           </Link>
           {address ? (
-            <Link href="/profile" className={styles.addressPill}>
-              <Identicon address={address} size={22} />
-              <span>{address.slice(0, 6)}...{address.slice(-4)}</span>
-            </Link>
+            <div className={styles.userArea}>
+              <Link href="/profile" className={styles.addressPill}>
+                <Identicon address={address} size={22} />
+                <span>{address.slice(0, 6)}...{address.slice(-4)}</span>
+              </Link>
+              <DisconnectButton className={styles.disconnectBtn} />
+            </div>
           ) : (
             <span className={styles.networkPill}>Sepolia</span>
           )}
