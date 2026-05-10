@@ -50,7 +50,7 @@ Peer-to-peer carpooling DApp on Ethereum (Sepolia). Drivers post rides, passenge
 ├── contracts/                # Solidity contracts (BlockRide)
 │   └── carpooling.sol        # contract BlockRide { ... }
 ├── scripts/deploy.js         # Hardhat deploy + Etherscan verify
-├── test/tests.js             # 15-test suite (escrow, refund, ratings...)
+├── test/tests.js             # 29-test suite (escrow, refunds, force-cancel, ratings, reentrancy...)
 ├── hardhat.config.js         # Hardhat config (Sepolia / Amoy / local)
 ├── web/                      # Next.js frontend
 │   ├── pages/
