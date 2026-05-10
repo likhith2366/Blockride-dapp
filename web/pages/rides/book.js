@@ -5,9 +5,11 @@ import { ethers } from "ethers";
 import {
   fetchAllRides,
   bookSeats,
+  cancelMyBooking,
   rateDriver,
   getMyAddress,
   fetchRating,
+  fetchMySeats,
 } from "../../utils/contract";
 import { useTx } from "../../hooks/useTx";
 import TxModal from "../../components/TxModal";
@@ -25,6 +27,7 @@ export default function Book() {
   const [address, setAddress] = useState("");
   const [filters, setFilters] = useState({ origin: "", destination: "", maxFareEth: "" });
   const [seatChoice, setSeatChoice] = useState({});
+  const [mySeats, setMySeats] = useState({}); // {rideId: seatCount}
   const tx = useTx();
 
   const reload = async () => {
@@ -33,9 +36,21 @@ export default function Book() {
     try {
       const list = await fetchAllRides();
       setRides(list);
+      let myAddr = "";
       try {
-        setAddress(await getMyAddress());
+        myAddr = await getMyAddress();
+        setAddress(myAddr);
       } catch {}
+      if (myAddr) {
+        const seatCounts = await Promise.all(
+          list.map((r) => fetchMySeats(r.id, myAddr).catch(() => 0))
+        );
+        const map = {};
+        list.forEach((r, i) => { if (seatCounts[i] > 0) map[r.id] = seatCounts[i]; });
+        setMySeats(map);
+      } else {
+        setMySeats({});
+      }
     } catch (e) {
       setError(e.message || "Failed to load rides");
     } finally {
@@ -52,12 +67,14 @@ export default function Book() {
     return rides.filter(
       (r) =>
         r.status === 0 &&
-        r.seatsAvailable > 0 &&
+        // Show fully-booked rides too if the user has seats on them, so they
+        // can still cancel.
+        (r.seatsAvailable > 0 || (mySeats[r.id] || 0) > 0) &&
         (!filters.origin || r.origin.toLowerCase().includes(filters.origin.toLowerCase())) &&
         (!filters.destination || r.destination.toLowerCase().includes(filters.destination.toLowerCase())) &&
         parseFloat(r.farePerSeatEth) <= max
     );
-  }, [rides, filters]);
+  }, [rides, filters, mySeats]);
 
   const handleBook = async (ride) => {
     const numSeats = Number(seatChoice[ride.id] || 1);
@@ -69,6 +86,23 @@ export default function Book() {
       await tx.run("Book ride", () =>
         bookSeats({ rideId: ride.id, numSeats, farePerSeatWei: ride.farePerSeatWei })
       );
+      await reload();
+    } catch {}
+  };
+
+  const handleCancelMyBooking = async (ride) => {
+    const now = Math.floor(Date.now() / 1000);
+    const isLate = ride.departsAt - now < 3600;
+    const refundPct = isLate ? 50 : 100;
+    const seats = mySeats[ride.id] || 0;
+    const ok = window.confirm(
+      `Cancel your ${seats} seat${seats > 1 ? "s" : ""} on ${ride.origin} → ${ride.destination}?\n\n` +
+      `Refund: ${refundPct}% (${isLate ? "less than 1h before departure - 50% goes to driver as no-show fee" : "more than 1h before departure - full refund"}).\n\n` +
+      `Refund will be queued to pendingRefunds[your address]. Withdraw later via the contract.`
+    );
+    if (!ok) return;
+    try {
+      await tx.run("Cancel my booking", () => cancelMyBooking(ride.id));
       await reload();
     } catch {}
   };
@@ -114,6 +148,11 @@ export default function Book() {
               ethers.BigNumber.from(r.farePerSeatWei).mul(seatChoice[r.id] || 1)
             );
             const isOwn = r.driver.toLowerCase() === address.toLowerCase();
+            const myCount = mySeats[r.id] || 0;
+            const now = Math.floor(Date.now() / 1000);
+            const departed = r.departsAt <= now;
+            const isLate = !departed && r.departsAt - now < 3600;
+            const canBook = !isOwn && r.seatsAvailable > 0;
             return (
               <li key={r.id} className={form.rideCard}>
                 <div className={form.rideHeader}>
@@ -133,24 +172,53 @@ export default function Book() {
                   <span>&#128100; {r.seatsAvailable}/{r.totalSeats} seats</span>
                   <span>&#128181; {r.farePerSeatEth} ETH/seat</span>
                 </div>
-                <div className={form.rideActions}>
-                  <input
-                    type="number"
-                    min="1"
-                    max={r.seatsAvailable}
-                    value={seatChoice[r.id] || 1}
-                    onChange={(e) => setSeatChoice({ ...seatChoice, [r.id]: e.target.value })}
-                  />
-                  <span className={form.totalPrice}>= {totalEth} ETH</span>
-                  <button
-                    type="button"
-                    className={form.submit}
-                    disabled={isOwn || tx.state.phase === "signing" || tx.state.phase === "pending"}
-                    onClick={() => handleBook(r)}
-                  >
-                    {isOwn ? "Your ride" : "Book"}
-                  </button>
-                </div>
+                {myCount > 0 && (
+                  <div className={form.myBookingBanner}>
+                    <span>
+                      You have <strong>{myCount}</strong> seat{myCount > 1 ? "s" : ""} on this ride.
+                    </span>
+                    {!departed && (
+                      <button
+                        type="button"
+                        className={form.cancelMine}
+                        disabled={tx.state.phase === "signing" || tx.state.phase === "pending"}
+                        onClick={() => handleCancelMyBooking(r)}
+                        title={
+                          isLate
+                            ? "Less than 1h before departure - 50% refund, 50% goes to driver"
+                            : "More than 1h before departure - full refund"
+                        }
+                      >
+                        Cancel my seats ({isLate ? "50% refund" : "full refund"})
+                      </button>
+                    )}
+                  </div>
+                )}
+                {canBook && (
+                  <div className={form.rideActions}>
+                    <input
+                      type="number"
+                      min="1"
+                      max={r.seatsAvailable}
+                      value={seatChoice[r.id] || 1}
+                      onChange={(e) => setSeatChoice({ ...seatChoice, [r.id]: e.target.value })}
+                    />
+                    <span className={form.totalPrice}>= {totalEth} ETH</span>
+                    <button
+                      type="button"
+                      className={form.submit}
+                      disabled={tx.state.phase === "signing" || tx.state.phase === "pending"}
+                      onClick={() => handleBook(r)}
+                    >
+                      Book
+                    </button>
+                  </div>
+                )}
+                {isOwn && !myCount && (
+                  <div className={form.rideActions}>
+                    <span className={form.totalPrice}>Your ride - manage from the dashboard</span>
+                  </div>
+                )}
               </li>
             );
           })}

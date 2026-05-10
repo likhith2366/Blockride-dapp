@@ -37,6 +37,17 @@ export default function Home() {
     (async () => {
       try {
         if (typeof window === "undefined" || !window.ethereum) return;
+
+        // Silently restore an already-authorized account. `eth_accounts` returns
+        // the connected account without prompting MetaMask; only `eth_requestAccounts`
+        // prompts. Without this, navigating back to "/" from any inner page would
+        // show the "Connect MetaMask" button even when the user is connected.
+        const accounts = await window.ethereum.request({ method: "eth_accounts" });
+        if (!cancelled && accounts && accounts.length > 0) {
+          setAddress(accounts[0]);
+          setWalletConnected(true);
+        }
+
         const provider = new ethers.providers.Web3Provider(window.ethereum, "any");
         const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider);
         const n = await contract.ridesPosted();

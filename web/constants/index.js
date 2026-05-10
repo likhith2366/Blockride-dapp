@@ -93,6 +93,11 @@ export const CONTRACT_ABI = [
   },
   {
     "inputs": [],
+    "name": "TooLateToCancel",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "TransferFailed",
     "type": "error"
   },
@@ -100,6 +105,43 @@ export const CONTRACT_ABI = [
     "inputs": [],
     "name": "WrongFare",
     "type": "error"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "rideId",
+        "type": "uint256"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "passenger",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint8",
+        "name": "seats",
+        "type": "uint8"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "refundQueued",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "forfeitToDriver",
+        "type": "uint256"
+      }
+    ],
+    "name": "BookingCancelled",
+    "type": "event"
   },
   {
     "anonymous": false,
@@ -320,6 +362,19 @@ export const CONTRACT_ABI = [
     "type": "function"
   },
   {
+    "inputs": [],
+    "name": "LATE_CANCEL_WINDOW",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
     "inputs": [
       {
         "internalType": "uint256",
@@ -335,6 +390,19 @@ export const CONTRACT_ABI = [
     "name": "bookSeats",
     "outputs": [],
     "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "rideId",
+        "type": "uint256"
+      }
+    ],
+    "name": "cancelMyBooking",
+    "outputs": [],
+    "stateMutability": "nonpayable",
     "type": "function"
   },
   {

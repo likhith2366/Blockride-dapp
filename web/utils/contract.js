@@ -51,6 +51,31 @@ export async function cancelRide(rideId) {
   return contract.cancelRide(rideId);
 }
 
+export async function cancelMyBooking(rideId) {
+  const contract = await getWriteContract();
+  return contract.cancelMyBooking(rideId);
+}
+
+export async function withdrawRefund() {
+  const contract = await getWriteContract();
+  return contract.withdrawRefund();
+}
+
+export async function fetchPendingRefund(address) {
+  const contract = await getReadContract();
+  const wei = await contract.pendingRefunds(address);
+  return {
+    wei: wei.toString(),
+    eth: ethers.utils.formatEther(wei),
+  };
+}
+
+export async function fetchMySeats(rideId, address) {
+  const contract = await getReadContract();
+  const seats = await contract.seatsBooked(rideId, address);
+  return Number(seats);
+}
+
 export async function rateDriver({ rideId, score, comment }) {
   const contract = await getWriteContract();
   return contract.rateDriver(rideId, score, comment || "");

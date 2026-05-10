@@ -38,6 +38,11 @@ contract BlockRide is ReentrancyGuard {
     ///         After it elapses, any passenger may force-cancel a still-Active ride.
     uint256 public constant FORCE_CANCEL_GRACE = 1 hours;
 
+    /// @notice Time-before-departure threshold for a full-refund passenger cancel.
+    ///         Cancelling later than this still works, but only 50% is refunded;
+    ///         the other 50% is queued to the driver as a no-show penalty.
+    uint256 public constant LATE_CANCEL_WINDOW = 1 hours;
+
     uint256 public ridesPosted;
     mapping(uint256 => Ride) public rides;
     mapping(address => Profile) public profiles;
@@ -70,6 +75,7 @@ contract BlockRide is ReentrancyGuard {
     error ScoreOutOfRange();
     error TooEarlyToComplete();
     error TooEarlyToForceCancel();
+    error TooLateToCancel();
     error NoRefundDue();
     error TransferFailed();
 
@@ -92,6 +98,13 @@ contract BlockRide is ReentrancyGuard {
     );
     event RideCompleted(uint256 indexed rideId, address indexed driver, uint256 payout);
     event RideCancelled(uint256 indexed rideId, address indexed canceller, uint256 totalRefundQueued);
+    event BookingCancelled(
+        uint256 indexed rideId,
+        address indexed passenger,
+        uint8 seats,
+        uint256 refundQueued,
+        uint256 forfeitToDriver
+    );
     event RefundWithdrawn(address indexed passenger, uint256 amount);
     event DriverRated(
         uint256 indexed rideId,
@@ -189,6 +202,45 @@ contract BlockRide is ReentrancyGuard {
         if (seatsBooked[rideId][msg.sender] == 0) revert NotPassenger();
         if (block.timestamp < r.departsAt + FORCE_CANCEL_GRACE) revert TooEarlyToForceCancel();
         _queueRefundsAndCancel(rideId);
+    }
+
+    /// @notice A passenger drops their own seats from an active ride before
+    ///         departure. Refund is time-tiered:
+    ///           - cancelling at least `LATE_CANCEL_WINDOW` before `departsAt`
+    ///             returns 100% of what the passenger paid;
+    ///           - cancelling inside that window returns 50% and queues the
+    ///             other 50% as a no-show penalty for the driver.
+    ///         Freed seats are returned to `seatsAvailable` so other riders
+    ///         can re-book them.
+    function cancelMyBooking(uint256 rideId) external {
+        Ride storage r = rides[rideId];
+        if (r.driver == address(0)) revert NoSuchRide();
+        if (r.status != RideStatus.Active) revert RideNotActive();
+        if (block.timestamp >= r.departsAt) revert TooLateToCancel();
+
+        uint8 seats = seatsBooked[rideId][msg.sender];
+        if (seats == 0) revert NotPassenger();
+
+        uint256 totalPaid = uint256(seats) * r.farePerSeat;
+        seatsBooked[rideId][msg.sender] = 0;
+        r.seatsAvailable += seats;
+        escrowOf[rideId] -= totalPaid;
+
+        uint256 refund;
+        uint256 forfeit;
+        if (r.departsAt - block.timestamp >= LATE_CANCEL_WINDOW) {
+            refund = totalPaid;
+        } else {
+            refund = totalPaid / 2;
+            forfeit = totalPaid - refund;
+        }
+
+        pendingRefunds[msg.sender] += refund;
+        if (forfeit > 0) {
+            pendingRefunds[r.driver] += forfeit;
+        }
+
+        emit BookingCancelled(rideId, msg.sender, seats, refund, forfeit);
     }
 
     function _queueRefundsAndCancel(uint256 rideId) internal {

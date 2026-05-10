@@ -15,6 +15,7 @@ Peer-to-peer carpooling DApp on Ethereum (Sepolia). Drivers post rides, passenge
 - **On-chain escrow.** Fares are locked in the contract at booking and released to the driver only after `completeRide`.
 - **Pull-pattern refunds.** When a ride is cancelled, each passenger's refund is queued in `pendingRefunds[passenger]`; passengers withdraw via `withdrawRefund()` whenever they choose. This isolates the cancel path from any single passenger contract reverting.
 - **Force-cancel for stuck escrow.** If the driver disappears after `departsAt + FORCE_CANCEL_GRACE` (1 hour), any passenger of the ride can call `forceCancel(rideId)` to flip the ride to `Cancelled` and queue refunds for everyone. No admin override required.
+- **Passenger self-cancel with time-tiered refunds.** A passenger can drop their own seats from an active ride before departure via `cancelMyBooking(rideId)`. If they cancel **more than 1 hour before** `departsAt` they get a 100% refund queued; if they cancel **inside the last hour** they get a 50% refund and the other 50% is queued to the driver as a no-show fee. Freed seats are returned to the pool so other riders can re-book them.
 - **Per-seat booking.** A passenger can book multiple seats in one transaction.
 - **Driver ratings.** Passengers can submit a 1-5 star rating + optional comment for completed rides. Driver average is queryable on-chain.
 - **Profile registration.** On-chain handle / age / gender record per address.
@@ -24,7 +25,7 @@ Peer-to-peer carpooling DApp on Ethereum (Sepolia). Drivers post rides, passenge
 - **History view.** Browse all rides on the contract or filter to your own; rate completed rides you booked.
 - **Driver dashboard.** Expand a posted ride to see every booked passenger, seats taken, and the rating they left (if any).
 - **Sepolia testnet ready.** Hardhat deploy script + Etherscan verification wired up.
-- **Hardhat test suite** (23 passing) covering posting, booking, payout, refund queueing, withdrawal, force-cancel, access control, ratings, bounds checks, and an adversarial reentrancy attack.
+- **Hardhat test suite** (29 passing) covering posting, booking, payout, refund queueing, withdrawal, driver-cancel, passenger self-cancel (both refund tiers + seat-restoration), force-cancel, access control, ratings, bounds checks, and an adversarial reentrancy attack.
 
 ## Tech Stack
 
@@ -40,7 +41,7 @@ Peer-to-peer carpooling DApp on Ethereum (Sepolia). Drivers post rides, passenge
 
 | Network | Address                                                                                                                              |
 | ------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| Sepolia | [`0xef90586DA0845E59425E61379170C0a7507e79b9`](https://sepolia.etherscan.io/address/0xef90586DA0845E59425E61379170C0a7507e79b9)     |
+| Sepolia | [`0xFd0d476E37D930f6d598457B12Cf97641e93A0A9`](https://sepolia.etherscan.io/address/0xFd0d476E37D930f6d598457B12Cf97641e93A0A9)     |
 
 ## Project Layout
 
@@ -118,6 +119,13 @@ npx hardhat test
       ✔ reverts before the grace window elapses
       ✔ reverts when the caller is not a passenger of the ride
       ✔ reverts on a ride that's already completed
+    cancelMyBooking (passenger self-cancel)
+      ✔ full refund when cancelling >= 1h before departure
+      ✔ 50/50 split when cancelling inside the late-cancel window
+      ✔ reverts after departsAt has passed
+      ✔ reverts when caller is not a passenger
+      ✔ reverts when ride is already cancelled (driver cancel first)
+      ✔ frees the seat so another passenger can re-book it
     ReentrancyGuard
       ✔ blocks a malicious passenger from reentering withdrawRefund
     ratings
@@ -128,7 +136,7 @@ npx hardhat test
       ✔ rejects rating before completion
       ✔ rejects out-of-range scores
 
-  23 passing (5s)
+  29 passing (7s)
 ```
 
 The reentrancy test (`ReentrancyGuard › blocks a malicious passenger from reentering withdrawRefund`) deploys a `MaliciousPassenger` helper contract whose `receive()` hook attempts to call `withdrawRefund` again during its own refund. The guard correctly reverts the inner call; the outer transfer still completes exactly once.
@@ -174,7 +182,7 @@ You'll need MetaMask connected to Sepolia and some test ETH (https://sepoliafauc
 5. Wait the 60 s. Switch back to the driver. **My rides** → **Complete & collect**. Escrow releases to the driver wallet.
 6. As the passenger, go to **History** → `All rides` → the completed ride → leave a 5-star rating with a comment.
 7. Open the driver's **Profile**. The on-chain rating average is now visible.
-8. Every step above is verifiable on Sepolia Etherscan via the [contract address](https://sepolia.etherscan.io/address/0xef90586DA0845E59425E61379170C0a7507e79b9).
+8. Every step above is verifiable on Sepolia Etherscan via the [contract address](https://sepolia.etherscan.io/address/0xFd0d476E37D930f6d598457B12Cf97641e93A0A9).
 
 ## Smart Contract Surface
 
@@ -185,6 +193,7 @@ function registerProfile(string handle, uint8 age, bool isMale) external;
 // Ride lifecycle
 function postRide(string origin, string destination, uint256 departsAt, uint256 farePerSeat, uint8 seats) external returns (uint256 rideId);
 function bookSeats(uint256 rideId, uint8 numSeats) external payable;
+function cancelMyBooking(uint256 rideId) external;    // passenger drops own seats, time-tiered refund
 function completeRide(uint256 rideId) external;       // driver only, after departsAt
 function cancelRide(uint256 rideId) external;         // driver only, queues refunds
 function forceCancel(uint256 rideId) external;        // any passenger, after departsAt + FORCE_CANCEL_GRACE
@@ -201,6 +210,7 @@ function pendingRefunds(address passenger) external view returns (uint256);
 
 // Constants
 uint256 public constant FORCE_CANCEL_GRACE = 1 hours;
+uint256 public constant LATE_CANCEL_WINDOW = 1 hours;
 ```
 
 ## Security Considerations
@@ -209,6 +219,7 @@ Each defense below corresponds to a concrete construct in [`contracts/carpooling
 
 - **Pull-pattern refunds.** `cancelRide` and `forceCancel` *queue* refunds in `pendingRefunds[passenger]` rather than transferring ETH inside the cancel transaction. Each passenger pulls their own funds via `withdrawRefund()`. This removes the dependency on every passenger's `receive()` hook succeeding — a single hostile passenger contract can no longer DoS cancellation for the rest of the ride.
 - **Defense-in-depth reentrancy.** `completeRide` and `withdrawRefund` are both `nonReentrant` (OpenZeppelin `ReentrancyGuard`). On top of that, every state mutation precedes every external `call` (Checks-Effects-Interactions). The adversarial test `ReentrancyGuard › blocks a malicious passenger from reentering withdrawRefund` deploys a `MaliciousPassenger` contract whose `receive()` hook tries to call `withdrawRefund` recursively; the guard correctly reverts the inner call while the legitimate transfer succeeds exactly once.
+- **Time-tiered passenger self-cancel.** `cancelMyBooking(rideId)` lets a passenger drop their seats from an active ride before departure. The contract checks `block.timestamp` against `departsAt`: cancelling at least `LATE_CANCEL_WINDOW` (1 hour) before departure queues 100% of what was paid to `pendingRefunds[passenger]`; cancelling inside that window splits 50/50 between the passenger's pending refund and the driver's pending refund (no-show penalty). Freed seats are added back to `seatsAvailable` so the slot can be re-sold. Six tests cover both refund tiers, the post-departure revert, the non-passenger revert, the cancelled-ride revert, and seat-restoration / re-booking.
 - **`forceCancel` rescues stuck escrow.** If the driver never calls `completeRide` or `cancelRide`, any passenger of the ride may call `forceCancel(rideId)` once `block.timestamp >= departsAt + FORCE_CANCEL_GRACE` (1 hour). This eliminates the previous risk that a vanished driver could lock fares in the contract indefinitely. Permission is checked via `seatsBooked[rideId][msg.sender] > 0` — only actual passengers can trigger it. Tests: 4 cases including the early-window revert, non-passenger revert, and non-Active-ride revert.
 - **Custom errors.** Every revert path uses a named error (`NotDriver`, `WrongFare`, `TooEarlyToForceCancel`, `NoRefundDue`, …) — gas-cheaper than `require` strings at runtime and decodable by the frontend for actionable error messages.
 - **Solidity ^0.8.24 built-in arithmetic checks.** All `+`, `-`, `*` operations revert on overflow/underflow without the need for SafeMath.

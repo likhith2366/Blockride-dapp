@@ -227,6 +227,98 @@ describe("BlockRide", function () {
     });
   });
 
+  // -------------------- cancelMyBooking (passenger self-cancel) --------------------
+  describe("cancelMyBooking (passenger self-cancel)", function () {
+    const LATE_CANCEL_WINDOW = 3600;
+
+    it("full refund when cancelling >= 1h before departure", async function () {
+      const departsAt = await futureTime(LATE_CANCEL_WINDOW + 1800); // 1.5h ahead
+      const fare = ethers.utils.parseEther("0.02");
+      await blockRide.connect(driver).postRide("Boston", "NYC", departsAt, fare, 3);
+      await blockRide.connect(alice).bookSeats(0, 2, { value: fare.mul(2) });
+
+      await blockRide.connect(alice).cancelMyBooking(0);
+
+      expect(await blockRide.pendingRefunds(alice.address)).to.equal(fare.mul(2));
+      expect(await blockRide.pendingRefunds(driver.address)).to.equal(0);
+      // Seats restored, escrow drained
+      expect((await blockRide.rides(0)).seatsAvailable).to.equal(3);
+      expect(await blockRide.escrowOf(0)).to.equal(0);
+      expect(await blockRide.seatsBooked(0, alice.address)).to.equal(0);
+    });
+
+    it("50/50 split when cancelling inside the late-cancel window", async function () {
+      const departsAt = await futureTime(LATE_CANCEL_WINDOW / 2); // 30 min ahead
+      const fare = ethers.utils.parseEther("0.05");
+      await blockRide.connect(driver).postRide("Boston", "NYC", departsAt, fare, 2);
+      await blockRide.connect(alice).bookSeats(0, 1, { value: fare });
+
+      await blockRide.connect(alice).cancelMyBooking(0);
+
+      const half = fare.div(2);
+      expect(await blockRide.pendingRefunds(alice.address)).to.equal(half);
+      expect(await blockRide.pendingRefunds(driver.address)).to.equal(fare.sub(half));
+      expect(await blockRide.escrowOf(0)).to.equal(0);
+    });
+
+    it("reverts after departsAt has passed", async function () {
+      const departsAt = await futureTime(60);
+      const fare = ethers.utils.parseEther("0.01");
+      await blockRide.connect(driver).postRide("Boston", "NYC", departsAt, fare, 1);
+      await blockRide.connect(alice).bookSeats(0, 1, { value: fare });
+      await advance(120);
+
+      await expect(
+        blockRide.connect(alice).cancelMyBooking(0)
+      ).to.be.revertedWithCustomError(blockRide, "TooLateToCancel");
+    });
+
+    it("reverts when caller is not a passenger", async function () {
+      const departsAt = await futureTime();
+      const fare = ethers.utils.parseEther("0.01");
+      await blockRide.connect(driver).postRide("Boston", "NYC", departsAt, fare, 1);
+
+      await expect(
+        blockRide.connect(bob).cancelMyBooking(0)
+      ).to.be.revertedWithCustomError(blockRide, "NotPassenger");
+    });
+
+    it("reverts when ride is already cancelled (driver cancel first)", async function () {
+      // Construct a case where the ride is non-Active but departsAt is still
+      // in the future, so the RideNotActive check (which runs before the time
+      // check in the contract) is the one being exercised.
+      const departsAt = await futureTime(LATE_CANCEL_WINDOW + 1800);
+      const fare = ethers.utils.parseEther("0.01");
+      await blockRide.connect(driver).postRide("Boston", "NYC", departsAt, fare, 1);
+      await blockRide.connect(alice).bookSeats(0, 1, { value: fare });
+      await blockRide.connect(driver).cancelRide(0);
+
+      await expect(
+        blockRide.connect(alice).cancelMyBooking(0)
+      ).to.be.revertedWithCustomError(blockRide, "RideNotActive");
+    });
+
+    it("frees the seat so another passenger can re-book it", async function () {
+      const departsAt = await futureTime(LATE_CANCEL_WINDOW + 1800);
+      const fare = ethers.utils.parseEther("0.01");
+      await blockRide.connect(driver).postRide("Boston", "NYC", departsAt, fare, 1);
+      await blockRide.connect(alice).bookSeats(0, 1, { value: fare });
+
+      // Ride is fully booked - bob would fail.
+      await expect(
+        blockRide.connect(bob).bookSeats(0, 1, { value: fare })
+      ).to.be.revertedWithCustomError(blockRide, "InvalidSeatCount");
+
+      // Alice cancels, seat returns to the pool.
+      await blockRide.connect(alice).cancelMyBooking(0);
+
+      // Bob can now book the freed seat.
+      await blockRide.connect(bob).bookSeats(0, 1, { value: fare });
+      expect(await blockRide.seatsBooked(0, bob.address)).to.equal(1);
+      expect((await blockRide.rides(0)).seatsAvailable).to.equal(0);
+    });
+  });
+
   // -------------------- Adversarial reentrancy --------------------
   describe("ReentrancyGuard", function () {
     it("blocks a malicious passenger from reentering withdrawRefund", async function () {
