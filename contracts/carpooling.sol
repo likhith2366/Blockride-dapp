@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.17;
+pragma solidity ^0.8.24;
+
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title BlockRide
-/// @notice Decentralized carpooling with on-chain fare escrow, cancellations, refunds, and driver ratings.
-contract BlockRide {
+/// @notice Decentralized carpooling with on-chain fare escrow, cancellations,
+///         pull-pattern refunds, force-cancel for stuck escrow, and driver ratings.
+contract BlockRide is ReentrancyGuard {
     enum RideStatus { Active, Completed, Cancelled }
 
     struct Profile {
@@ -31,6 +34,10 @@ contract BlockRide {
         bool submitted;
     }
 
+    /// @notice Window after departsAt during which the driver alone can finalize.
+    ///         After it elapses, any passenger may force-cancel a still-Active ride.
+    uint256 public constant FORCE_CANCEL_GRACE = 1 hours;
+
     uint256 public ridesPosted;
     mapping(uint256 => Ride) public rides;
     mapping(address => Profile) public profiles;
@@ -38,10 +45,35 @@ contract BlockRide {
     mapping(uint256 => mapping(address => uint8)) public seatsBooked;
     mapping(uint256 => uint256) public escrowOf;
 
+    /// @notice ETH owed to a passenger from a cancelled / force-cancelled ride.
+    ///         Withdrawable via {withdrawRefund}. Pull-pattern: avoids letting a
+    ///         hostile passenger contract DoS the cancel path for everyone.
+    mapping(address => uint256) public pendingRefunds;
+
     mapping(uint256 => mapping(address => Rating)) public ratings;
     mapping(address => uint256) public driverTotalStars;
     mapping(address => uint256) public driverRatingCount;
 
+    // -------------------- Custom errors --------------------
+    error NotDriver();
+    error NoSuchRide();
+    error RideNotActive();
+    error RideNotCompleted();
+    error InvalidSeatCount();
+    error DriverCannotBook();
+    error WrongFare();
+    error DepartInPast();
+    error SeatsRequired();
+    error HandleRequired();
+    error NotPassenger();
+    error AlreadyRated();
+    error ScoreOutOfRange();
+    error TooEarlyToComplete();
+    error TooEarlyToForceCancel();
+    error NoRefundDue();
+    error TransferFailed();
+
+    // -------------------- Events --------------------
     event ProfileRegistered(address indexed user, string handle);
     event RidePosted(
         uint256 indexed rideId,
@@ -59,7 +91,8 @@ contract BlockRide {
         uint256 amountPaid
     );
     event RideCompleted(uint256 indexed rideId, address indexed driver, uint256 payout);
-    event RideCancelled(uint256 indexed rideId, uint256 totalRefunded);
+    event RideCancelled(uint256 indexed rideId, address indexed canceller, uint256 totalRefundQueued);
+    event RefundWithdrawn(address indexed passenger, uint256 amount);
     event DriverRated(
         uint256 indexed rideId,
         address indexed driver,
@@ -69,16 +102,18 @@ contract BlockRide {
     );
 
     modifier onlyDriver(uint256 rideId) {
-        require(rides[rideId].driver == msg.sender, "BlockRide: not driver");
+        if (rides[rideId].driver != msg.sender) revert NotDriver();
         _;
     }
 
+    // -------------------- Profile --------------------
     function registerProfile(string calldata _handle, uint8 _age, bool _isMale) external {
-        require(bytes(_handle).length > 0, "BlockRide: handle required");
+        if (bytes(_handle).length == 0) revert HandleRequired();
         profiles[msg.sender] = Profile(_handle, _age, _isMale, true);
         emit ProfileRegistered(msg.sender, _handle);
     }
 
+    // -------------------- Ride lifecycle --------------------
     function postRide(
         string calldata _origin,
         string calldata _destination,
@@ -86,8 +121,8 @@ contract BlockRide {
         uint256 _farePerSeat,
         uint8 _seats
     ) external returns (uint256 rideId) {
-        require(_seats > 0, "BlockRide: seats > 0");
-        require(_departsAt > block.timestamp, "BlockRide: depart in past");
+        if (_seats == 0) revert SeatsRequired();
+        if (_departsAt <= block.timestamp) revert DepartInPast();
         rideId = ridesPosted;
         rides[rideId] = Ride({
             id: rideId,
@@ -106,12 +141,12 @@ contract BlockRide {
 
     function bookSeats(uint256 rideId, uint8 numSeats) external payable {
         Ride storage r = rides[rideId];
-        require(r.driver != address(0), "BlockRide: no such ride");
-        require(r.status == RideStatus.Active, "BlockRide: ride inactive");
-        require(numSeats > 0 && numSeats <= r.seatsAvailable, "BlockRide: invalid seats");
-        require(msg.sender != r.driver, "BlockRide: driver cannot book");
+        if (r.driver == address(0)) revert NoSuchRide();
+        if (r.status != RideStatus.Active) revert RideNotActive();
+        if (numSeats == 0 || numSeats > r.seatsAvailable) revert InvalidSeatCount();
+        if (msg.sender == r.driver) revert DriverCannotBook();
         uint256 owed = uint256(numSeats) * r.farePerSeat;
-        require(msg.value == owed, "BlockRide: wrong fare");
+        if (msg.value != owed) revert WrongFare();
 
         if (seatsBooked[rideId][msg.sender] == 0) {
             passengersOf[rideId].push(msg.sender);
@@ -123,27 +158,45 @@ contract BlockRide {
         emit SeatsBooked(rideId, msg.sender, numSeats, msg.value);
     }
 
-    function completeRide(uint256 rideId) external onlyDriver(rideId) {
+    function completeRide(uint256 rideId) external onlyDriver(rideId) nonReentrant {
         Ride storage r = rides[rideId];
-        require(r.status == RideStatus.Active, "BlockRide: not active");
-        require(block.timestamp >= r.departsAt, "BlockRide: too early");
+        if (r.status != RideStatus.Active) revert RideNotActive();
+        if (block.timestamp < r.departsAt) revert TooEarlyToComplete();
         r.status = RideStatus.Completed;
 
         uint256 payout = escrowOf[rideId];
         escrowOf[rideId] = 0;
         if (payout > 0) {
             (bool ok, ) = payable(r.driver).call{value: payout}("");
-            require(ok, "BlockRide: payout failed");
+            if (!ok) revert TransferFailed();
         }
         emit RideCompleted(rideId, r.driver, payout);
     }
 
+    /// @notice Driver cancels their own active ride. Refunds are queued for
+    ///         passengers to pull via {withdrawRefund}.
     function cancelRide(uint256 rideId) external onlyDriver(rideId) {
+        _queueRefundsAndCancel(rideId);
+    }
+
+    /// @notice Anyone (typically a passenger) may force-cancel a stuck ride
+    ///         after `departsAt + FORCE_CANCEL_GRACE` if the driver has neither
+    ///         completed nor cancelled it. Refunds are queued for pull-withdrawal.
+    /// @dev    Must be a passenger of the ride to invoke.
+    function forceCancel(uint256 rideId) external {
         Ride storage r = rides[rideId];
-        require(r.status == RideStatus.Active, "BlockRide: not active");
+        if (r.driver == address(0)) revert NoSuchRide();
+        if (seatsBooked[rideId][msg.sender] == 0) revert NotPassenger();
+        if (block.timestamp < r.departsAt + FORCE_CANCEL_GRACE) revert TooEarlyToForceCancel();
+        _queueRefundsAndCancel(rideId);
+    }
+
+    function _queueRefundsAndCancel(uint256 rideId) internal {
+        Ride storage r = rides[rideId];
+        if (r.status != RideStatus.Active) revert RideNotActive();
         r.status = RideStatus.Cancelled;
 
-        uint256 totalRefund;
+        uint256 totalQueued;
         address[] memory pax = passengersOf[rideId];
         for (uint256 i = 0; i < pax.length; i++) {
             address p = pax[i];
@@ -151,20 +204,30 @@ contract BlockRide {
             if (seats == 0) continue;
             uint256 owed = uint256(seats) * r.farePerSeat;
             seatsBooked[rideId][p] = 0;
-            (bool ok, ) = payable(p).call{value: owed}("");
-            require(ok, "BlockRide: refund failed");
-            totalRefund += owed;
+            pendingRefunds[p] += owed;
+            totalQueued += owed;
         }
         escrowOf[rideId] = 0;
-        emit RideCancelled(rideId, totalRefund);
+        emit RideCancelled(rideId, msg.sender, totalQueued);
     }
 
+    /// @notice Pull a previously queued refund to the caller's address.
+    function withdrawRefund() external nonReentrant {
+        uint256 amount = pendingRefunds[msg.sender];
+        if (amount == 0) revert NoRefundDue();
+        pendingRefunds[msg.sender] = 0;
+        (bool ok, ) = payable(msg.sender).call{value: amount}("");
+        if (!ok) revert TransferFailed();
+        emit RefundWithdrawn(msg.sender, amount);
+    }
+
+    // -------------------- Ratings --------------------
     function rateDriver(uint256 rideId, uint8 score, string calldata comment) external {
         Ride storage r = rides[rideId];
-        require(r.status == RideStatus.Completed, "BlockRide: ride not completed");
-        require(seatsBooked[rideId][msg.sender] > 0, "BlockRide: not a passenger");
-        require(!ratings[rideId][msg.sender].submitted, "BlockRide: already rated");
-        require(score >= 1 && score <= 5, "BlockRide: score must be 1-5");
+        if (r.status != RideStatus.Completed) revert RideNotCompleted();
+        if (seatsBooked[rideId][msg.sender] == 0) revert NotPassenger();
+        if (ratings[rideId][msg.sender].submitted) revert AlreadyRated();
+        if (score < 1 || score > 5) revert ScoreOutOfRange();
 
         ratings[rideId][msg.sender] = Rating(score, comment, true);
         driverTotalStars[r.driver] += score;
@@ -178,6 +241,7 @@ contract BlockRide {
         avgTimes100 = (driverTotalStars[driver] * 100) / count;
     }
 
+    // -------------------- Views --------------------
     function getPassengers(uint256 rideId) external view returns (address[] memory) {
         return passengersOf[rideId];
     }

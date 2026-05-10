@@ -13,21 +13,24 @@ Peer-to-peer carpooling DApp on Ethereum (Sepolia). Drivers post rides, passenge
 ## Features
 
 - **On-chain escrow.** Fares are locked in the contract at booking and released to the driver only after `completeRide`.
-- **Driver cancellation with full refunds.** A single `cancelRide` call atomically reimburses every passenger.
+- **Pull-pattern refunds.** When a ride is cancelled, each passenger's refund is queued in `pendingRefunds[passenger]`; passengers withdraw via `withdrawRefund()` whenever they choose. This isolates the cancel path from any single passenger contract reverting.
+- **Force-cancel for stuck escrow.** If the driver disappears after `departsAt + FORCE_CANCEL_GRACE` (1 hour), any passenger of the ride can call `forceCancel(rideId)` to flip the ride to `Cancelled` and queue refunds for everyone. No admin override required.
 - **Per-seat booking.** A passenger can book multiple seats in one transaction.
 - **Driver ratings.** Passengers can submit a 1-5 star rating + optional comment for completed rides. Driver average is queryable on-chain.
 - **Profile registration.** On-chain handle / age / gender record per address.
+- **Reentrancy-hardened.** All ETH-moving entry points (`completeRide`, `withdrawRefund`) use OpenZeppelin's `ReentrancyGuard` on top of the Checks-Effects-Interactions pattern. An adversarial test deploys a malicious passenger contract that attempts to reenter `withdrawRefund` from its `receive()` hook — the guard rejects it.
+- **Custom errors throughout.** All revert paths use named errors (`NotDriver`, `WrongFare`, `TooEarlyToForceCancel`, …) — gas-cheaper than revert strings and decodable in the frontend.
 - **Rich UI.** Animated landing page, transaction-progress modal with Etherscan link, identicon avatars derived from each address, status badges, star-rating widget.
 - **History view.** Browse all rides on the contract or filter to your own; rate completed rides you booked.
 - **Driver dashboard.** Expand a posted ride to see every booked passenger, seats taken, and the rating they left (if any).
 - **Sepolia testnet ready.** Hardhat deploy script + Etherscan verification wired up.
-- **Hardhat test suite** (15 passing) covering posting, booking, payout, refund, access control, ratings, and bounds checks.
+- **Hardhat test suite** (23 passing) covering posting, booking, payout, refund queueing, withdrawal, force-cancel, access control, ratings, bounds checks, and an adversarial reentrancy attack.
 
 ## Tech Stack
 
 | Layer            | Tech                                                              |
 | ---------------- | ----------------------------------------------------------------- |
-| Smart contract   | Solidity `^0.8.17`                                                |
+| Smart contract   | Solidity `^0.8.24`, OpenZeppelin `ReentrancyGuard`                |
 | Toolchain        | Hardhat, ethers v5, hardhat-toolbox, solidity-coverage            |
 | Frontend         | Next.js 13, React 18, MetaMask (window.ethereum), CSS Modules     |
 | Networks         | Sepolia (chainId `11155111`), Polygon Amoy, localhost             |
@@ -37,7 +40,7 @@ Peer-to-peer carpooling DApp on Ethereum (Sepolia). Drivers post rides, passenge
 
 | Network | Address                                                                                                                              |
 | ------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| Sepolia | [`0xD9311a8e8fb3f3470ad50732457bbDA9dCC3A761`](https://sepolia.etherscan.io/address/0xD9311a8e8fb3f3470ad50732457bbDA9dCC3A761)     |
+| Sepolia | [`0xef90586DA0845E59425E61379170C0a7507e79b9`](https://sepolia.etherscan.io/address/0xef90586DA0845E59425E61379170C0a7507e79b9)     |
 
 ## Project Layout
 
@@ -103,9 +106,20 @@ npx hardhat test
     ✔ rejects booking with wrong fare
     ✔ rejects driver booking own ride
     ✔ pays out escrow to driver on completion (after departure time)
-    ✔ refunds passengers on cancellation
-    ✔ only driver can complete or cancel a ride
+    ✔ queues refunds (pull pattern) on driver cancellation
+    ✔ only driver can cancelRide (and only driver can completeRide)
     ✔ blocks booking after cancel
+    withdrawRefund (pull-pattern refunds)
+      ✔ transfers a queued refund to the caller
+      ✔ reverts when nothing is owed
+      ✔ accumulates refunds across multiple cancelled rides
+    forceCancel (stuck-escrow rescue)
+      ✔ lets a passenger force-cancel after departsAt + FORCE_CANCEL_GRACE
+      ✔ reverts before the grace window elapses
+      ✔ reverts when the caller is not a passenger of the ride
+      ✔ reverts on a ride that's already completed
+    ReentrancyGuard
+      ✔ blocks a malicious passenger from reentering withdrawRefund
     ratings
       ✔ lets a passenger rate the driver after completion
       ✔ computes a running average across multiple ratings
@@ -114,10 +128,12 @@ npx hardhat test
       ✔ rejects rating before completion
       ✔ rejects out-of-range scores
 
-  15 passing (3s)
+  23 passing (5s)
 ```
 
-The suite covers booking math, escrow accounting, access control, status-machine transitions, refund flow, and the rating bounds + uniqueness rules.
+The reentrancy test (`ReentrancyGuard › blocks a malicious passenger from reentering withdrawRefund`) deploys a `MaliciousPassenger` helper contract whose `receive()` hook attempts to call `withdrawRefund` again during its own refund. The guard correctly reverts the inner call; the outer transfer still completes exactly once.
+
+The suite covers booking math, escrow accounting, access control, status-machine transitions, queued-refund + withdrawal flow, the force-cancel rescue path with all four revert conditions, an adversarial reentrancy attack, and the full rating bounds + uniqueness rules.
 
 ## Deploy
 
@@ -158,46 +174,61 @@ You'll need MetaMask connected to Sepolia and some test ETH (https://sepoliafauc
 5. Wait the 60 s. Switch back to the driver. **My rides** → **Complete & collect**. Escrow releases to the driver wallet.
 6. As the passenger, go to **History** → `All rides` → the completed ride → leave a 5-star rating with a comment.
 7. Open the driver's **Profile**. The on-chain rating average is now visible.
-8. Every step above is verifiable on Sepolia Etherscan via the [contract address](https://sepolia.etherscan.io/address/0xD9311a8e8fb3f3470ad50732457bbDA9dCC3A761).
+8. Every step above is verifiable on Sepolia Etherscan via the [contract address](https://sepolia.etherscan.io/address/0xef90586DA0845E59425E61379170C0a7507e79b9).
 
 ## Smart Contract Surface
 
 ```solidity
+// Profile
 function registerProfile(string handle, uint8 age, bool isMale) external;
+
+// Ride lifecycle
 function postRide(string origin, string destination, uint256 departsAt, uint256 farePerSeat, uint8 seats) external returns (uint256 rideId);
 function bookSeats(uint256 rideId, uint8 numSeats) external payable;
 function completeRide(uint256 rideId) external;       // driver only, after departsAt
-function cancelRide(uint256 rideId) external;          // driver only, refunds all
+function cancelRide(uint256 rideId) external;         // driver only, queues refunds
+function forceCancel(uint256 rideId) external;        // any passenger, after departsAt + FORCE_CANCEL_GRACE
+function withdrawRefund() external;                   // pull queued refund
+
+// Ratings
 function rateDriver(uint256 rideId, uint8 score, string comment) external;  // 1-5
+
+// Views
 function driverAverage(address driver) external view returns (uint256 avgTimes100, uint256 count);
 function getAllRides() external view returns (Ride[] memory);
 function getPassengers(uint256 rideId) external view returns (address[] memory);
+function pendingRefunds(address passenger) external view returns (uint256);
+
+// Constants
+uint256 public constant FORCE_CANCEL_GRACE = 1 hours;
 ```
 
 ## Security Considerations
 
-The contract was designed with the following defenses in mind. Each item below corresponds to a concrete construct in [`contracts/carpooling.sol`](contracts/carpooling.sol).
+Each defense below corresponds to a concrete construct in [`contracts/carpooling.sol`](contracts/carpooling.sol).
 
-- **Checks-Effects-Interactions pattern.** State changes happen *before* every external ETH transfer, which protects against reentrancy without needing a `ReentrancyGuard`. In `completeRide` (lines 130–136), `r.status` is set to `Completed` and `escrowOf[rideId]` is zeroed *before* the `payable(driver).call`. In `cancelRide` (lines 153–155), each passenger's `seatsBooked` is zeroed *before* their refund call — so a malicious passenger contract that reenters during `receive()` would find its booked-seats balance already at zero.
-- **Solidity ^0.8.17 built-in arithmetic checks.** All `+`, `-`, `*` operations revert on overflow/underflow without the need for SafeMath.
-- **Access control via `onlyDriver` modifier.** `completeRide` and `cancelRide` are gated to `rides[rideId].driver`. Non-drivers cannot trigger payout or cancellation. Test: `only driver can complete or cancel a ride`.
-- **Status state machine.** Each ride is `Active → Completed | Cancelled` and every state-changing function checks `status == Active` first. Double-completion, completion-after-cancel, and cancel-after-complete are all impossible. Test: `blocks booking after cancel`.
+- **Pull-pattern refunds.** `cancelRide` and `forceCancel` *queue* refunds in `pendingRefunds[passenger]` rather than transferring ETH inside the cancel transaction. Each passenger pulls their own funds via `withdrawRefund()`. This removes the dependency on every passenger's `receive()` hook succeeding — a single hostile passenger contract can no longer DoS cancellation for the rest of the ride.
+- **Defense-in-depth reentrancy.** `completeRide` and `withdrawRefund` are both `nonReentrant` (OpenZeppelin `ReentrancyGuard`). On top of that, every state mutation precedes every external `call` (Checks-Effects-Interactions). The adversarial test `ReentrancyGuard › blocks a malicious passenger from reentering withdrawRefund` deploys a `MaliciousPassenger` contract whose `receive()` hook tries to call `withdrawRefund` recursively; the guard correctly reverts the inner call while the legitimate transfer succeeds exactly once.
+- **`forceCancel` rescues stuck escrow.** If the driver never calls `completeRide` or `cancelRide`, any passenger of the ride may call `forceCancel(rideId)` once `block.timestamp >= departsAt + FORCE_CANCEL_GRACE` (1 hour). This eliminates the previous risk that a vanished driver could lock fares in the contract indefinitely. Permission is checked via `seatsBooked[rideId][msg.sender] > 0` — only actual passengers can trigger it. Tests: 4 cases including the early-window revert, non-passenger revert, and non-Active-ride revert.
+- **Custom errors.** Every revert path uses a named error (`NotDriver`, `WrongFare`, `TooEarlyToForceCancel`, `NoRefundDue`, …) — gas-cheaper than `require` strings at runtime and decodable by the frontend for actionable error messages.
+- **Solidity ^0.8.24 built-in arithmetic checks.** All `+`, `-`, `*` operations revert on overflow/underflow without the need for SafeMath.
+- **Access control via `onlyDriver` modifier.** `completeRide` and `cancelRide` are gated to `rides[rideId].driver`. Non-drivers cannot trigger payout or driver-initiated cancellation. Test: `only driver can cancelRide (and only driver can completeRide)`.
+- **Status state machine.** Each ride is `Active → Completed | Cancelled`; every state-changing function checks `status == Active` first. Double-completion, completion-after-cancel, force-cancel-after-complete, and cancel-after-complete are all impossible.
 - **Self-booking blocked.** `bookSeats` rejects `msg.sender == driver`, so a driver cannot inflate their own rating or escrow. Test: `rejects driver booking own ride`.
 - **Exact fare enforcement.** `bookSeats` requires `msg.value == numSeats * farePerSeat` — over-payment and under-payment both revert. No surplus dust accumulates in escrow. Test: `rejects booking with wrong fare`.
 - **Time gate on completion.** `completeRide` requires `block.timestamp >= departsAt`, so a driver cannot pocket fares before the agreed departure time.
-- **Rating integrity.** `rateDriver` enforces `score ∈ [1, 5]`, requires the rater to be a passenger of that specific ride, requires the ride to be `Completed`, and rejects double-rating. Driver-average is computed deterministically as `totalStars * 100 / count`. Tests: `rejects out-of-range scores`, `rejects double rating from the same passenger`, `rejects ratings from non-passengers`, `rejects rating before completion`.
-- **Per-seat escrow accounting.** The contract tracks `escrowOf[rideId]` explicitly rather than relying on `address(this).balance`, so force-fed ETH (e.g. via a `selfdestruct` from another contract) cannot disturb per-ride bookkeeping.
-- **Bounded loop in `cancelRide`.** The refund loop iterates over `passengersOf[rideId]`, which is bounded by `totalSeats` (a `uint8`, capped at 255 per ride) — gas-safe against griefing.
+- **Rating integrity.** `rateDriver` enforces `score ∈ [1, 5]`, requires the rater to be a passenger of that specific ride, requires the ride to be `Completed`, and rejects double-rating. Driver-average is computed deterministically as `totalStars * 100 / count`. Five separate tests cover the bounds and uniqueness rules.
+- **Per-seat escrow accounting.** The contract tracks `escrowOf[rideId]` and `pendingRefunds[passenger]` explicitly rather than relying on `address(this).balance`, so force-fed ETH (e.g. via a `selfdestruct` from another contract) cannot disturb per-ride bookkeeping.
+- **Bounded loops.** The refund-queueing loop in `_queueRefundsAndCancel` iterates over `passengersOf[rideId]`, which is bounded by `totalSeats` (a `uint8`, capped at 255 per ride) — gas-safe against griefing.
 
 ## Known Limitations
 
-Honest disclosures of what this contract does *not* protect against. Several of these would be addressed in a v2 redesign.
+Honest disclosures of what this contract does *not* protect against. The previous limitations around hostile-passenger DoS and stuck escrow have been closed in this revision (see Security Considerations above for how).
 
 - **No off-chain ride verification.** `completeRide` is driver-controlled. The contract cannot tell whether a ride physically happened, so passengers must trust that a driver who marks a ride complete actually delivered them. A real production system would need an oracle, GPS attestation, or a passenger-confirmation step before payout.
-- **Hostile-passenger DoS on `cancelRide`.** Refunds use `(bool ok, ) = call{value: …}; require(ok, …)`. If a passenger's address is a contract that always reverts in `receive()`, the entire `cancelRide` transaction reverts — bricking cancellation for everyone on that ride. A pull-pattern (each passenger calls `withdrawRefund` themselves) would eliminate this. Same shape applies to `completeRide`'s payout to the driver, but there the driver is the one griefing themselves.
-- **Stuck-escrow risk.** There is no upper time bound on `completeRide`, no admin override, and no automatic refund. If a driver disappears after passengers book (never calls `completeRide` or `cancelRide`), the fares are locked in escrow indefinitely. A v2 should add a `forceCancel` callable by any passenger after `departsAt + Δ`.
-- **No dispute mechanism.** A passenger who shows up but is left behind has no on-chain recourse beyond a 1-star rating after the fact. Reputation is the only deterrent.
+- **No dispute mechanism for completed rides.** A passenger who shows up but is left behind has no on-chain recourse beyond a 1-star rating after the fact. Reputation is the only deterrent. (Stuck-escrow rides are now recoverable via `forceCancel` — that path was previously listed here and has been resolved.)
 - **`getAllRides` returns the full array unpaginated.** Fine on testnet; on a busy production deployment this view will eventually exceed RPC response limits and need pagination.
+- **Frontend doesn't yet surface the new contract capabilities.** The deployed UI exposes the post / book / complete / cancel / rate flow but does not yet wire up `forceCancel` or `withdrawRefund` buttons. The capabilities are tested at the contract level; UI integration is the next iteration.
 - **Single chain.** Deployed only to Sepolia. No bridges, no L2 deployments.
 - **Trust the driver's wallet.** A stolen driver key is indistinguishable from a live driver — the contract has no concept of identity loss or recovery.
 

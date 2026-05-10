@@ -5,10 +5,16 @@ describe("BlockRide", function () {
   let blockRide;
   let driver, alice, bob;
   const ONE_HOUR = 3600;
+  const FORCE_CANCEL_GRACE = 3600; // matches contract constant
 
   async function futureTime(offsetSeconds = ONE_HOUR) {
     const block = await ethers.provider.getBlock("latest");
     return block.timestamp + offsetSeconds;
+  }
+
+  async function advance(seconds) {
+    await ethers.provider.send("evm_increaseTime", [seconds]);
+    await ethers.provider.send("evm_mine", []);
   }
 
   beforeEach(async function () {
@@ -56,7 +62,7 @@ describe("BlockRide", function () {
 
     await expect(
       blockRide.connect(alice).bookSeats(0, 2, { value: fare })
-    ).to.be.revertedWith("BlockRide: wrong fare");
+    ).to.be.revertedWithCustomError(blockRide, "WrongFare");
   });
 
   it("rejects driver booking own ride", async function () {
@@ -66,7 +72,7 @@ describe("BlockRide", function () {
 
     await expect(
       blockRide.connect(driver).bookSeats(0, 1, { value: fare })
-    ).to.be.revertedWith("BlockRide: driver cannot book");
+    ).to.be.revertedWithCustomError(blockRide, "DriverCannotBook");
   });
 
   it("pays out escrow to driver on completion (after departure time)", async function () {
@@ -76,8 +82,7 @@ describe("BlockRide", function () {
     await blockRide.connect(alice).bookSeats(0, 1, { value: fare });
     await blockRide.connect(bob).bookSeats(0, 1, { value: fare });
 
-    await ethers.provider.send("evm_increaseTime", [120]);
-    await ethers.provider.send("evm_mine", []);
+    await advance(120);
 
     const balanceBefore = await ethers.provider.getBalance(driver.address);
     const tx = await blockRide.connect(driver).completeRide(0);
@@ -89,33 +94,28 @@ describe("BlockRide", function () {
     expect(await blockRide.escrowOf(0)).to.equal(0);
   });
 
-  it("refunds passengers on cancellation", async function () {
+  it("queues refunds (pull pattern) on driver cancellation", async function () {
     const departsAt = await futureTime();
     const fare = ethers.utils.parseEther("0.02");
     await blockRide.connect(driver).postRide("Boston", "NYC", departsAt, fare, 3);
     await blockRide.connect(alice).bookSeats(0, 2, { value: fare.mul(2) });
     await blockRide.connect(bob).bookSeats(0, 1, { value: fare });
 
-    const aliceBefore = await ethers.provider.getBalance(alice.address);
-    const bobBefore = await ethers.provider.getBalance(bob.address);
-
     await blockRide.connect(driver).cancelRide(0);
 
-    const aliceAfter = await ethers.provider.getBalance(alice.address);
-    const bobAfter = await ethers.provider.getBalance(bob.address);
-
-    expect(aliceAfter.sub(aliceBefore)).to.equal(fare.mul(2));
-    expect(bobAfter.sub(bobBefore)).to.equal(fare);
+    expect(await blockRide.pendingRefunds(alice.address)).to.equal(fare.mul(2));
+    expect(await blockRide.pendingRefunds(bob.address)).to.equal(fare);
     expect(await blockRide.escrowOf(0)).to.equal(0);
+    expect((await blockRide.rides(0)).status).to.equal(2); // Cancelled
   });
 
-  it("only driver can complete or cancel a ride", async function () {
+  it("only driver can cancelRide (and only driver can completeRide)", async function () {
     const departsAt = await futureTime();
     const fare = ethers.utils.parseEther("0.01");
     await blockRide.connect(driver).postRide("Boston", "NYC", departsAt, fare, 1);
 
-    await expect(blockRide.connect(alice).cancelRide(0)).to.be.revertedWith("BlockRide: not driver");
-    await expect(blockRide.connect(alice).completeRide(0)).to.be.revertedWith("BlockRide: not driver");
+    await expect(blockRide.connect(alice).cancelRide(0)).to.be.revertedWithCustomError(blockRide, "NotDriver");
+    await expect(blockRide.connect(alice).completeRide(0)).to.be.revertedWithCustomError(blockRide, "NotDriver");
   });
 
   it("blocks booking after cancel", async function () {
@@ -125,17 +125,148 @@ describe("BlockRide", function () {
     await blockRide.connect(driver).cancelRide(0);
     await expect(
       blockRide.connect(alice).bookSeats(0, 1, { value: fare })
-    ).to.be.revertedWith("BlockRide: ride inactive");
+    ).to.be.revertedWithCustomError(blockRide, "RideNotActive");
   });
 
+  // -------------------- withdrawRefund --------------------
+  describe("withdrawRefund (pull-pattern refunds)", function () {
+    it("transfers a queued refund to the caller", async function () {
+      const departsAt = await futureTime();
+      const fare = ethers.utils.parseEther("0.03");
+      await blockRide.connect(driver).postRide("Boston", "NYC", departsAt, fare, 3);
+      await blockRide.connect(alice).bookSeats(0, 2, { value: fare.mul(2) });
+      await blockRide.connect(driver).cancelRide(0);
+
+      expect(await blockRide.pendingRefunds(alice.address)).to.equal(fare.mul(2));
+
+      const balanceBefore = await ethers.provider.getBalance(alice.address);
+      const tx = await blockRide.connect(alice).withdrawRefund();
+      const receipt = await tx.wait();
+      const gasCost = receipt.gasUsed.mul(receipt.effectiveGasPrice);
+      const balanceAfter = await ethers.provider.getBalance(alice.address);
+
+      expect(balanceAfter.add(gasCost).sub(balanceBefore)).to.equal(fare.mul(2));
+      expect(await blockRide.pendingRefunds(alice.address)).to.equal(0);
+    });
+
+    it("reverts when nothing is owed", async function () {
+      await expect(
+        blockRide.connect(alice).withdrawRefund()
+      ).to.be.revertedWithCustomError(blockRide, "NoRefundDue");
+    });
+
+    it("accumulates refunds across multiple cancelled rides", async function () {
+      const fare = ethers.utils.parseEther("0.01");
+      const t1 = await futureTime();
+      await blockRide.connect(driver).postRide("A", "B", t1, fare, 1);
+      await blockRide.connect(alice).bookSeats(0, 1, { value: fare });
+      await blockRide.connect(driver).cancelRide(0);
+
+      const t2 = await futureTime();
+      await blockRide.connect(driver).postRide("C", "D", t2, fare, 1);
+      await blockRide.connect(alice).bookSeats(1, 1, { value: fare });
+      await blockRide.connect(driver).cancelRide(1);
+
+      expect(await blockRide.pendingRefunds(alice.address)).to.equal(fare.mul(2));
+    });
+  });
+
+  // -------------------- forceCancel --------------------
+  describe("forceCancel (stuck-escrow rescue)", function () {
+    it("lets a passenger force-cancel after departsAt + FORCE_CANCEL_GRACE", async function () {
+      const departsAt = await futureTime(60);
+      const fare = ethers.utils.parseEther("0.02");
+      await blockRide.connect(driver).postRide("Boston", "NYC", departsAt, fare, 2);
+      await blockRide.connect(alice).bookSeats(0, 1, { value: fare });
+
+      await advance(60 + FORCE_CANCEL_GRACE + 1);
+
+      await blockRide.connect(alice).forceCancel(0);
+
+      expect((await blockRide.rides(0)).status).to.equal(2); // Cancelled
+      expect(await blockRide.pendingRefunds(alice.address)).to.equal(fare);
+    });
+
+    it("reverts before the grace window elapses", async function () {
+      const departsAt = await futureTime(60);
+      const fare = ethers.utils.parseEther("0.02");
+      await blockRide.connect(driver).postRide("Boston", "NYC", departsAt, fare, 1);
+      await blockRide.connect(alice).bookSeats(0, 1, { value: fare });
+
+      await advance(60); // exactly at departsAt
+
+      await expect(
+        blockRide.connect(alice).forceCancel(0)
+      ).to.be.revertedWithCustomError(blockRide, "TooEarlyToForceCancel");
+    });
+
+    it("reverts when the caller is not a passenger of the ride", async function () {
+      const departsAt = await futureTime(60);
+      const fare = ethers.utils.parseEther("0.01");
+      await blockRide.connect(driver).postRide("Boston", "NYC", departsAt, fare, 1);
+      await blockRide.connect(alice).bookSeats(0, 1, { value: fare });
+      await advance(60 + FORCE_CANCEL_GRACE + 1);
+
+      await expect(
+        blockRide.connect(bob).forceCancel(0)
+      ).to.be.revertedWithCustomError(blockRide, "NotPassenger");
+    });
+
+    it("reverts on a ride that's already completed", async function () {
+      const departsAt = await futureTime(60);
+      const fare = ethers.utils.parseEther("0.01");
+      await blockRide.connect(driver).postRide("Boston", "NYC", departsAt, fare, 1);
+      await blockRide.connect(alice).bookSeats(0, 1, { value: fare });
+      await advance(120);
+      await blockRide.connect(driver).completeRide(0);
+      await advance(FORCE_CANCEL_GRACE + 1);
+
+      await expect(
+        blockRide.connect(alice).forceCancel(0)
+      ).to.be.revertedWithCustomError(blockRide, "RideNotActive");
+    });
+  });
+
+  // -------------------- Adversarial reentrancy --------------------
+  describe("ReentrancyGuard", function () {
+    it("blocks a malicious passenger from reentering withdrawRefund", async function () {
+      const Mal = await ethers.getContractFactory("MaliciousPassenger");
+      const mal = await Mal.deploy(blockRide.address);
+      await mal.deployed();
+
+      const departsAt = await futureTime();
+      const fare = ethers.utils.parseEther("0.05");
+      await blockRide.connect(driver).postRide("Boston", "NYC", departsAt, fare, 1);
+
+      // Malicious contract books a seat (funded by alice, sent through mal).
+      await mal.connect(alice).book(0, 1, { value: fare });
+
+      // Driver cancels: refund queued for the malicious contract.
+      await blockRide.connect(driver).cancelRide(0);
+      expect(await blockRide.pendingRefunds(mal.address)).to.equal(fare);
+
+      // Trigger the attack: mal.attack() calls withdrawRefund(), which sends
+      // ETH to mal.receive(), which tries to reenter withdrawRefund().
+      // The guard should reject the reentry; the legitimate transfer still
+      // succeeds for exactly `fare` and the contract's pending balance is 0.
+      const balBefore = await ethers.provider.getBalance(mal.address);
+      await mal.connect(alice).attack();
+      const balAfter = await ethers.provider.getBalance(mal.address);
+
+      expect(balAfter.sub(balBefore)).to.equal(fare); // funds delivered exactly once
+      expect(await blockRide.pendingRefunds(mal.address)).to.equal(0);
+      expect(await mal.reentryAttempts()).to.be.gte(1); // attempt happened
+    });
+  });
+
+  // -------------------- Ratings --------------------
   describe("ratings", function () {
     async function setupCompletedRide(fare = ethers.utils.parseEther("0.01")) {
       const departsAt = await futureTime(60);
       await blockRide.connect(driver).postRide("Boston", "NYC", departsAt, fare, 2);
       await blockRide.connect(alice).bookSeats(0, 1, { value: fare });
       await blockRide.connect(bob).bookSeats(0, 1, { value: fare });
-      await ethers.provider.send("evm_increaseTime", [120]);
-      await ethers.provider.send("evm_mine", []);
+      await advance(120);
       await blockRide.connect(driver).completeRide(0);
     }
 
@@ -167,7 +298,7 @@ describe("BlockRide", function () {
       const [, , , stranger] = await ethers.getSigners();
       await expect(
         blockRide.connect(stranger).rateDriver(0, 5, "")
-      ).to.be.revertedWith("BlockRide: not a passenger");
+      ).to.be.revertedWithCustomError(blockRide, "NotPassenger");
     });
 
     it("rejects double rating from the same passenger", async function () {
@@ -175,7 +306,7 @@ describe("BlockRide", function () {
       await blockRide.connect(alice).rateDriver(0, 5, "");
       await expect(
         blockRide.connect(alice).rateDriver(0, 4, "")
-      ).to.be.revertedWith("BlockRide: already rated");
+      ).to.be.revertedWithCustomError(blockRide, "AlreadyRated");
     });
 
     it("rejects rating before completion", async function () {
@@ -185,13 +316,13 @@ describe("BlockRide", function () {
       await blockRide.connect(alice).bookSeats(0, 1, { value: fare });
       await expect(
         blockRide.connect(alice).rateDriver(0, 5, "")
-      ).to.be.revertedWith("BlockRide: ride not completed");
+      ).to.be.revertedWithCustomError(blockRide, "RideNotCompleted");
     });
 
     it("rejects out-of-range scores", async function () {
       await setupCompletedRide();
-      await expect(blockRide.connect(alice).rateDriver(0, 0, "")).to.be.revertedWith("BlockRide: score must be 1-5");
-      await expect(blockRide.connect(alice).rateDriver(0, 6, "")).to.be.revertedWith("BlockRide: score must be 1-5");
+      await expect(blockRide.connect(alice).rateDriver(0, 0, "")).to.be.revertedWithCustomError(blockRide, "ScoreOutOfRange");
+      await expect(blockRide.connect(alice).rateDriver(0, 6, "")).to.be.revertedWithCustomError(blockRide, "ScoreOutOfRange");
     });
   });
 });
